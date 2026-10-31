@@ -80,3 +80,20 @@ class bash_ldpreload_multilib(libkcov.TestCase):
         dom = cobertura.parseFile(self.outbase + "/kcov/sh-shebang.sh/cobertura.xml")
         self.assertIsNone(cobertura.hitsPerLine(dom, "sh-shebang.sh", 1))
         self.assertEqual(1, cobertura.hitsPerLine(dom, "sh-shebang.sh", 4))
+
+
+class bash_nested_strings(libkcov.TestCase):
+    # Old bash, as on macOS, may not parse quotes inside "$(...)" like this
+    def runTest(self):
+        rv, o = self.do(
+            self.kcov + " " + self.outbase + "/kcov " + self.sources + "/tests/bash/nested-strings.sh"
+        )
+
+        dom = cobertura.parseFile(self.outbase + "/kcov/nested-strings.sh/cobertura.xml")
+
+        for line in (5, 7, 9, 11, 18, 25, 27, 32, 38, 42, 44, 47, 52, 53, 57, 62, 69, 77, 81):
+            assert cobertura.hitsPerLine(dom, "nested-strings.sh", line) == 1, line
+
+        # String bodies, here document bodies and first lines of multi-line strings
+        for line in (14, 15, 16, 21, 22, 23, 30, 35, 36, 39, 40, 48, 49, 50, 51, 54, 55, 56, 60, 65, 66, 72, 73, 74, 75, 78, 79):
+            assert cobertura.hitsPerLine(dom, "nested-strings.sh", line) is None, line

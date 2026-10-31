@@ -657,8 +657,19 @@ private:
 		}
 	}
 
-	size_t findHeredocStart(const std::string &s, char &quoteChar, size_t &commentStart)
+	/*
+	 * Scan a line and return where its first "<<" outside a string starts. Also
+	 * set commentStart where a comment starts, and update quotes, the constructs
+	 * open at the end of the line, innermost last. They can span lines:
+	 *
+	 *   " and '     a string
+	 *   $           a $'...' string, which has backslash escapes
+	 *   ( and `     a command substitution in a string, with its own quoting
+	 *   {           a ${...} in a string, where " nests and ' is not tracked
+	 */
+	size_t findHeredocStart(const std::string &s, std::string &quotes, size_t &commentStart)
 	{
+		size_t heredocStart = std::string::npos;
 		bool escaped = false;
 		int bracketDepth = 0;
 		int braceDepth = 0;
@@ -668,6 +679,8 @@ private:
 		for (size_t i = 0; i < s.size(); i++)
 		{
 			const char c = s[i];
+			const char next = i + 1 < s.size() ? s[i + 1] : '\0';
+			const char top = quotes.empty() ? '\0' : quotes[quotes.size() - 1];
 
 			if (escaped)
 			{
@@ -675,29 +688,84 @@ private:
 				continue;
 			}
 
-			if (c == '\\' && quoteChar != '\'')
+			if (c == '\\' && top != '\'')
 			{
 				escaped = true;
 				continue;
 			}
 
-			if (quoteChar != '\0')
+			if (top == '\'' || top == '$')
 			{
-				if (c == quoteChar)
-					quoteChar = '\0';
+				if (c == '\'')
+					quotes.erase(quotes.size() - 1);
+				continue;
+			}
+
+			if (top == '"' || top == '{')
+			{
+				if (c == '$' && next == '{')
+				{
+					quotes += '{';
+					i++;
+				}
+				// $(( is arithmetic: stay in the string, where << is no here document
+				else if (c == '$' && next == '(' && (i + 2 >= s.size() || s[i + 2] != '('))
+				{
+					quotes += '(';
+					i++;
+				}
+				else if (c == '`')
+					quotes += '`';
+				else if (c == '"' && top == '{')
+					quotes += '"';
+				else if ((c == '"' && top == '"') || (c == '}' && top == '{'))
+					quotes.erase(quotes.size() - 1);
+				continue;
+			}
+
+			if (c == '`' && top == '`')
+			{
+				quotes.erase(quotes.size() - 1);
+				continue;
+			}
+
+			if (c == '$' && next == '\'')
+			{
+				quotes += '$';
+				i++;
 				continue;
 			}
 
 			if (c == '"' || c == '\'')
 			{
-				quoteChar = c;
+				quotes += c;
 				continue;
 			}
 
-			if (c == '$' && i + 1 < s.size() && s[i + 1] == '{')
+			if (c == '(' && top == '(')
+			{
+				quotes += '(';
+				continue;
+			}
+
+			if (c == ')' && top == '(')
+			{
+				quotes.erase(quotes.size() - 1);
+				continue;
+			}
+
+			if (c == '$' && next == '{')
+			{
 				braceDepth++;
-			else if (c == '}' && braceDepth > 0)
+				i++;
+				continue;
+			}
+
+			if (c == '}' && braceDepth > 0)
+			{
 				braceDepth--;
+				continue;
+			}
 
 			// A comment starts a word: a#b, $# and ${#x} are not comments
 			if (c == '#' && braceDepth == 0
@@ -721,19 +789,19 @@ private:
 				continue;
 			}
 
-			if (c == '<' && i + 1 < s.size() && s[i + 1] == '<')
+			if (c == '<' && next == '<')
 			{
-				if (bracketDepth > 0)
-				{
-					i++;
-					continue;
-				}
+				if (bracketDepth == 0 && quotes.empty())
+					return i;
 
-				return i;
+				if (bracketDepth == 0 && heredocStart == std::string::npos)
+					heredocStart = i;
+
+				i++;
 			}
 		}
 
-		return std::string::npos;
+		return heredocStart;
 	}
 
 	void parseFileFull(const std::string &filename, const std::vector<std::string> &lines, uint32_t crc)
@@ -745,7 +813,8 @@ private:
 		} state = none;
 		bool caseActive = false;
 		bool arithmeticActive = false;
-		char quoteChar = '\0';
+		std::string quotes;
+		size_t commentStart;
 		std::string heredocMarker;
 
 		for (std::vector<std::string>::const_iterator it = lines.begin(); it != lines.end(); ++it)
@@ -758,7 +827,7 @@ private:
 
 			// Remove comments
 			size_t comment = s.find("#");
-			if (comment != std::string::npos)
+			if (comment != std::string::npos && quotes.empty())
 			{
 
 				// But not $# or ${#variable}...
@@ -787,21 +856,33 @@ private:
 			if (s.size() >= 2 && s[0] == ';' && s[1] == ';')
 				continue;
 
-			// Empty braces
+			// Empty braces, which can close something in a string
 			if ((s[0] == '{' || s[0] == '}') && s.size() == 1)
+			{
+				if (state == none)
+					findHeredocStart(s, quotes, commentStart);
 				continue;
+			}
 
-			// Empty parentheses
+			// Empty parentheses, likewise
 			if ((s[0] == '(' || s[0] == ')') && s.size() == 1)
+			{
+				if (state == none)
+					findHeredocStart(s, quotes, commentStart);
 				continue;
+			}
 
 			// While, if, switch endings
 			if (s == "esac" || s == "fi" || s == "do" || s == "done" || s == "else" || s == "then")
 				continue;
 
-			// Functions
+			// Functions, whose line can open a string
 			if (s.find("function") == 0)
+			{
+				if (state == none)
+					findHeredocStart(s, quotes, commentStart);
 				continue;
+			}
 
 			// fn() { .... Yes, regexes would have been better
 			size_t fnPos = s.find("()");
@@ -817,7 +898,11 @@ private:
 
 				// Should be a single word (the function name)
 				if (substr.find(" ") == std::string::npos)
+				{
+					if (state == none)
+						findHeredocStart(s, quotes, commentStart);
 					continue;
+				}
 			}
 
 			// Handle backslashes - only the first line is code
@@ -838,20 +923,21 @@ private:
 				continue;
 			}
 
-			size_t commentStart;
-			size_t heredocStart = findHeredocStart(s, quoteChar, commentStart);
+			size_t heredocStart = findHeredocStart(s, quotes, commentStart);
 
 			if (commentStart != std::string::npos)
 				s = trim_string(s.substr(0, commentStart));
 
-			// Multi-line quote - only the last line is code
-			if (quoteChar != '\0')
+			// Multi-line quote - only the last line is code. A here document can
+			// start inside one, in a command substitution
+			const bool inQuote = !quotes.empty();
+			if (s == "" || (inQuote && heredocStart == std::string::npos))
 				continue;
 
-			if (s.find("$((") != std::string::npos || s.find("$[") != std::string::npos)
+			if (!inQuote && (s.find("$((") != std::string::npos || s.find("$[") != std::string::npos))
 				arithmeticActive = true;
 
-			if (s[s.size() - 1] == '\\')
+			if (!inQuote && s[s.size() - 1] == '\\')
 			{
 				state = backslash;
 			}
@@ -908,6 +994,9 @@ private:
 						continue;
 				}
 			}
+
+			if (inQuote)
+				continue;
 
 			// Special case to ignore 'done' followed by input / output redirection operators
 			// ('<', '>', '>>', optionally preceded by file descriptors) when the input is a
